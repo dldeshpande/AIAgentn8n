@@ -1,4 +1,4 @@
-# Plan: QA Chat → Jira Ticket AI Agent (n8n)
+# Plan: QA Chat → Jira Bug Ticket AI Agent (n8n)
 
 ## 1. Goal
 
@@ -8,9 +8,9 @@ A QA engineer describes an issue in plain language in a chat window, for example
 
 The AI agent then:
 
-1. Understands the message and works out the ticket type (Bug / Task / Story).
+1. Checks that the message describes a **bug** (a defect). The agent creates **Bug tickets only**; it politely declines tasks, feature requests and questions.
 2. Asks follow-up questions if key details are missing (steps, expected vs actual, environment…).
-3. Drafts a properly formatted Jira ticket and shows it in the chat for review.
+3. Drafts a properly formatted Jira **Bug** ticket and shows it in the chat for review.
 4. Creates the ticket in Jira once the QA confirms ("yes" / "create it").
 5. Replies with the ticket key and link (e.g. `QA-123 → https://yourcompany.atlassian.net/browse/QA-123`).
 
@@ -55,13 +55,13 @@ The AI agent then:
 | 3 | **Jira API token** | https://id.atlassian.com/manage-profile/security/api-tokens → *Create API token* |
 | 4 | **Jira account email** | The Atlassian account that owns the token (needs "Create issues" permission in the project) |
 | 5 | **LLM API key** | Anthropic Console (Claude) or OpenAI |
-| 6 | **Jira metadata** | Project key, issue types (Bug/Task/Story), priorities, components, labels you want to use |
+| 6 | **Jira metadata** | Project key, issue type `Bug` (confirm it exists in the project), priorities, components, labels you want to use |
 
 > Never commit API keys. Store them only as **n8n credentials**; keep a `.env.example` with placeholder names only.
 
 ---
 
-## 4. Jira ticket format (the "proper format")
+## 4. Jira Bug ticket format (the "proper format")
 
 The agent always produces this structure. Description uses **Jira wiki markup** (what the n8n Jira node sends).
 
@@ -107,22 +107,6 @@ Blocks regression run. Console error: {{TypeError: cannot read 'message' of unde
 | Labels | e.g. `qa-reported`, `regression`, `ui`, `login` |
 | Component | Mapped from module mentioned (Login → `Authentication`) |
 
-### 4.2 Task / Story (non-bug requests from QA)
-
-```
-Summary: Short action-oriented title
-
-h3. Description / User Story
-As a <role>, I want <goal> so that <benefit>.
-
-h3. Acceptance Criteria
-# Given … When … Then …
-# …
-
-h3. Notes
-…
-```
-
 ---
 
 ## 5. Agent behaviour (system prompt draft)
@@ -136,12 +120,13 @@ You are a QA Jira Assistant. You convert a QA engineer's chat message into a
 well-structured Jira ticket for project {{ $env.JIRA_PROJECT_KEY }}.
 
 Process:
-1. Classify the request as Bug, Task or Story.
+1. Confirm the request describes a bug. If it is not a bug (task, feature
+   request, question), do not create anything; reply that you only log bugs.
 2. Extract: summary, environment, build, browser/OS, preconditions, steps to
    reproduce, expected result, actual result, reproducibility, priority,
    labels, component.
 3. If any REQUIRED field is missing, ask the user ONE concise message listing
-   only the missing items. Required for Bug: steps to reproduce, expected
+   only the missing items. Required: steps to reproduce, expected
    result, actual result, environment. Never invent these.
 4. When you have enough info, call search_jira to look for similar open
    issues. If you find likely duplicates, show them and ask whether to continue.
@@ -192,7 +177,7 @@ Agent ─▶ "✅ Created QA-123: https://yourcompany.atlassian.net/browse/QA-12
    - System message: §5 prompt.
 4. Add tool **Jira Software Tool** → *Issue: Create*, name it `create_jira_ticket`:
    - Project: your project (fixed).
-   - Issue Type: `{{ $fromAI('issueType', 'Bug, Task or Story') }}`
+   - Issue Type: **fixed** – select `Bug` from the list (do not let the AI choose). This also avoids the issue-type ID problem: the node sends the type as an ID, which the list selection fills in for you.
    - Summary: `{{ $fromAI('summary', 'ticket summary, max 100 chars') }}`
    - Additional Fields → Description: `{{ $fromAI('description', 'full description in Jira wiki markup') }}`
    - Priority: `{{ $fromAI('priority', 'Highest, High, Medium or Low') }}`
@@ -228,7 +213,8 @@ Agent ─▶ "✅ Created QA-123: https://yourcompany.atlassian.net/browse/QA-12
 | 2 | "Checkout button not working" | Asks for steps, expected/actual, environment – does **not** create yet |
 | 3 | "App crashes when uploading 10MB file" | Priority = Highest |
 | 4 | "Typo on About page: 'Contcat us'" | Priority = Low, label `ui`/`content` |
-| 5 | "We need test data seeding for staging" | Classified as Task, not Bug |
+| 5 | "We need test data seeding for staging" | Not a bug → politely declines, explains it only creates Bug tickets; **no ticket created** |
+| 5b | "Please add a dark mode option" (feature request) | Not a bug → politely declines; **no ticket created** |
 | 6 | User replies "edit: priority High" to a draft | Draft updated and shown again |
 | 7 | Very similar issue already exists in Jira | Shows duplicate(s), asks whether to continue |
 | 8 | User says "no" / "cancel" | No ticket created |
@@ -272,8 +258,7 @@ Run: `docker compose up -d` → open http://localhost:5678.
 ├── prompts/
 │   └── system_prompt.md         ← agent system message (§5)
 ├── templates/
-│   ├── bug_template.md          ← §4.1
-│   └── story_task_template.md   ← §4.2
+│   └── bug_template.md          ← §4.1
 ├── workflows/
 │   └── qa_jira_ticket_agent.json ← exported n8n workflow
 └── tests/
@@ -328,7 +313,7 @@ R — ROLE
 =====================================================================
 You are "QA Jira Assistant", a senior QA analyst and Jira expert.
 Your job is to turn a QA engineer's informal chat message into one
-clear, complete, correctly formatted Jira ticket in project
+clear, complete, correctly formatted Jira Bug ticket in project
 <<PROJECT_KEY>>, and to create it only after the QA engineer confirms.
 
 =====================================================================
@@ -338,12 +323,15 @@ Follow these steps in order, every time:
 
 1. UNDERSTAND
    - Read the QA engineer's message (and earlier messages in this chat).
-   - Classify the request:
-       * Bug   = something that works incorrectly or differently from
-                 what is expected.
-       * Task  = a piece of work to do (test data, environment setup,
-                 test automation, investigation).
-       * Story = a new feature or behaviour change from a user's view.
+   - You create BUG tickets ONLY. Decide whether the message describes
+     a bug: something in the application that works incorrectly,
+     crashes, shows wrong data, or behaves differently from what is
+     expected.
+   - If it is NOT a bug (a task, test-data or environment request, a
+     new feature, an improvement idea, or a question), do not draft or
+     create anything. Reply with message E from OUTPUT FORMAT and stop.
+   - If you are not sure, ask one short question: "Is this something
+     that is not working as expected?"
    - If the message contains several separate problems, say so and
      handle them one ticket at a time.
 
@@ -468,26 +456,23 @@ Create this ticket? Reply **yes** to create, or tell me what to change.
 =====================================================================
 P — PARAMETERS (fields and rules)
 =====================================================================
-Field             | Bug      | Task     | Story    | Rule
-------------------|----------|----------|----------|---------------------------------
-Type              | required | required | required | Bug / Task / Story
-Summary           | required | required | required | "[Module] short problem/action",
-                  |          |          |          | max 100 chars, no final period
-Priority          | required | required | required | see priority rules below
-Component         | optional | optional | optional | only from Allowed components
-Labels            | optional | optional | optional | lowercase, words joined by "-",
-                  |          |          |          | no spaces; always add qa-reported
-Environment       | required | optional | —        | from Allowed environments
-Build/Version     | optional | —        | —        | "Not provided" if missing
-Browser/Device/OS | optional | —        | —        | "Not provided" if missing
-Preconditions     | optional | —        | —        |
-Steps to Reproduce| required | —        | —        | numbered, one action per step
-Expected Result   | required | —        | —        |
-Actual Result     | required | —        | —        |
-Reproducibility   | optional | —        | —        | Always / Intermittent (x/y) / Once
-Description       | —        | required | required | Story: "As a <role>, I want <goal>
-                  |          |          |          | so that <benefit>."
-Acceptance Crit.  | —        | optional | required | Given / When / Then, numbered
+Field              | Required? | Rule
+-------------------|-----------|------------------------------------------
+Type               | fixed     | always Bug
+Summary            | required  | "[Module] short problem", max 100 chars,
+                   |           | no final period
+Priority           | required  | see priority rules below
+Component          | optional  | only from Allowed components
+Labels             | optional  | lowercase, words joined by "-", no spaces;
+                   |           | always add qa-reported
+Environment        | required  | from Allowed environments
+Build/Version      | optional  | "Not provided" if missing
+Browser/Device/OS  | optional  | "Not provided" if missing
+Preconditions      | optional  |
+Steps to Reproduce | required  | numbered, one action per step
+Expected Result    | required  |
+Actual Result      | required  |
+Reproducibility    | optional  | Always / Intermittent (x/y) / Once
 
 Priority rules:
 - Highest : crash, data loss, security issue, payment failure,
@@ -507,12 +492,12 @@ Limits:
 O — OUTPUT FORMAT
 =====================================================================
 A) When information is missing:
-   "Looks like a <Type>. To write a complete ticket I need:
+   "Looks like a Bug. To write a complete ticket I need:
     • <missing item 1>
     • <missing item 2>"
 
 B) Draft (always in this order):
-   **Type:** <Bug|Task|Story>
+   **Type:** Bug
    **Summary:** <summary>
    **Priority:** <Highest|High|Medium|Low>
    **Component:** <component or "None">
@@ -522,19 +507,12 @@ B) Draft (always in this order):
 
    Create this ticket? Reply **yes** to create, or tell me what to change.
 
-   Bug description template:
+   Description template (always all sections, in this order):
      h3. Description / h3. Environment / h3. Preconditions /
      h3. Steps to Reproduce / h3. Expected Result / h3. Actual Result /
      h3. Reproducibility / h3. Additional Info
 
-   Task description template:
-     h3. Description / h3. Acceptance Criteria / h3. Notes
-
-   Story description template:
-     h3. User Story / h3. Acceptance Criteria / h3. Notes
-
 C) When calling create_jira_ticket, pass:
-   issueType   = Bug | Task | Story
    summary     = the summary text
    priority    = Highest | High | Medium | Low
    labels      = list of labels
@@ -544,6 +522,11 @@ C) When calling create_jira_ticket, pass:
 
 D) After creation:
    "✅ Created <KEY>: <<JIRA_BASE_URL>>/browse/<KEY>"
+
+E) When the request is not a bug:
+   "I can only create Bug tickets. If you've found a defect, tell me
+    what went wrong, what you expected to happen, and where it
+    happened (environment / page)."
 
 =====================================================================
 T — TONE
