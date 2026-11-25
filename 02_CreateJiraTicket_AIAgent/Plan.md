@@ -41,7 +41,7 @@ The AI agent then:
 | **AI Agent** (Tools Agent) | The "brain": follows the system prompt, asks questions, calls tools |
 | **Anthropic Chat Model** (or OpenAI Chat Model) | LLM behind the agent (e.g. `claude-sonnet-5-5`) |
 | **Window Buffer Memory** (Simple Memory) | Remembers the conversation per session so follow-up questions work |
-| **Jira Software Tool** – *Create Issue* | Creates the ticket (exposed to the agent as a tool) |
+| **Call n8n Workflow Tool** – `create_jira_ticket` | Calls the sub-workflow **"Create Jira Bug"**, which checks confirmation, converts priority/component names to Jira IDs, then creates the Bug (Code node + Jira *Create Issue*) |
 | **Jira Software Tool** – *Get Many Issues* (JQL) | Optional: checks for possible duplicates before creating |
 
 ---
@@ -56,6 +56,8 @@ The AI agent then:
 | 4 | **Jira account email** | The Atlassian account that owns the token (needs "Create issues" permission in the project) |
 | 5 | **LLM API key** | Anthropic Console (Claude) or OpenAI |
 | 6 | **Jira metadata** | Project key, issue type `Bug` (confirm it exists in the project), priorities, components, labels you want to use |
+
+| 7 | **Priority & component IDs** | The Jira node needs IDs, not names. Open `https://yourcompany.atlassian.net/rest/api/2/priority` and `https://yourcompany.atlassian.net/rest/api/2/project/<PROJECT_KEY>/components` in your browser (while logged in) and note each `name` → `id` |
 
 > Never commit API keys. Store them only as **n8n credentials**; keep a `.env.example` with placeholder names only.
 
@@ -166,7 +168,7 @@ Agent ─▶ "✅ Created QA-123: https://yourcompany.atlassian.net/browse/QA-12
 2. In n8n → **Credentials**:
    - *Jira Software Cloud API*: email + API token + domain `https://yourcompany.atlassian.net`.
    - *Anthropic* (or *OpenAI*): API key.
-3. In Jira, confirm project key, issue types, priorities, and create labels/components you plan to use.
+3. In Jira, confirm project key, the `Bug` issue type, priorities, and create labels/components you plan to use. Note the priority and component **IDs** (§3, row 7).
 
 ### Phase 2 – Basic chat → ticket (MVP)
 1. New workflow **"QA → Jira Ticket Agent"**.
@@ -175,19 +177,137 @@ Agent ─▶ "✅ Created QA-123: https://yourcompany.atlassian.net/browse/QA-12
    - Sub-node *Chat Model*: Anthropic Chat Model, model `claude-sonnet-5-5`, temperature `0.2`.
    - Sub-node *Memory*: Simple Memory (window buffer), context window ~20 messages, session key = `{{ $json.sessionId }}`.
    - System message: §5 prompt.
-4. Add tool **Jira Software Tool** → *Issue: Create*, name it `create_jira_ticket`:
-   - Project: your project (fixed).
-   - Issue Type: **fixed** – select `Bug` from the list (do not let the AI choose). This also avoids the issue-type ID problem: the node sends the type as an ID, which the list selection fills in for you.
-   - Summary: `{{ $fromAI('summary', 'ticket summary, max 100 chars') }}`
-   - Additional Fields → Description: `{{ $fromAI('description', 'full description in Jira wiki markup') }}`
-   - Priority: `{{ $fromAI('priority', 'Highest, High, Medium or Low') }}`
-   - Labels: `{{ $fromAI('labels', 'comma separated labels') }}`
+4. **Build the sub-workflow "Create Jira Bug"** (a separate workflow; the agent calls it as its `create_jira_ticket` tool).
+
+   > Why a sub-workflow? n8n's Jira node sends **priority** and **components** to Jira as **IDs**, but the agent works with names (`High`, `Authentication`). The sub-workflow converts names → IDs and also refuses to create anything unless the user confirmed the draft.
+
+   1. New workflow → name it **Create Jira Bug**.
+   2. Add trigger **When Executed by Another Workflow** → *Input data mode*: **Define using fields below**, add:
+
+      | Name | Type |
+      |---|---|
+      | `summary` | String |
+      | `description` | String |
+      | `priority` | String |
+      | `component` | String |
+      | `labels` | String (comma-separated) |
+      | `confirmed` | Boolean |
+
+   3. Add a **Code** node → *Mode*: **Run Once for Each Item**, *Language*: JavaScript, and paste the script below (same as [`scripts/map_fields.js`](scripts/map_fields.js)). Fill in `PRIORITY_IDS` and `COMPONENT_IDS` with your IDs from §3 row 7.
+
+      ```javascript
+      // n8n Code node — sub-workflow "Create Jira Bug"
+      // Mode: "Run Once for Each Item"   Language: JavaScript
+      //
+      // Converts the names the AI agent sends (priority, component, labels)
+      // into what the Jira node needs (IDs / list), and refuses to continue
+      // unless the user confirmed the draft.
+
+      // ---- 1. Fill these in for YOUR Jira site ---------------------------------
+      // Priority IDs:  open <<JIRA_BASE_URL>>/rest/api/2/priority in your browser
+      // (Jira Cloud defaults are shown below — check yours).
+      const PRIORITY_IDS = {
+        highest: '1',
+        high: '2',
+        medium: '3',
+        low: '4',
+        lowest: '5',
+      };
+
+      // Component IDs: open
+      // <<JIRA_BASE_URL>>/rest/api/2/project/<<PROJECT_KEY>>/components
+      // and copy "name" → "id". Keys must be lowercase.
+      const COMPONENT_IDS = {
+        // authentication: '10001',
+        // checkout: '10002',
+      };
+      // ---------------------------------------------------------------------------
+
+      const input = $json;
+
+      // 2. Confirmation guard
+      const confirmed = input.confirmed === true || String(input.confirmed).toLowerCase() === 'true';
+      if (!confirmed) {
+        throw new Error(
+          'Not confirmed by user. Show the draft again and ask the user to reply "yes" before creating the ticket.',
+        );
+      }
+
+      // 3. Required fields
+      const summary = String(input.summary || '').trim();
+      const description = String(input.description || '').trim();
+      if (!summary || !description) {
+        throw new Error('Missing summary or description. Complete the draft before creating the ticket.');
+      }
+
+      // 4. Priority name -> ID (unknown -> Medium)
+      const priorityName = String(input.priority || '').trim().toLowerCase();
+      const priorityId = PRIORITY_IDS[priorityName] || PRIORITY_IDS.medium;
+      const priorityNote = PRIORITY_IDS[priorityName] ? '' : `Unknown priority "${input.priority}", used Medium.`;
+
+      // 5. Component name -> ID (unknown -> none)
+      const componentName = String(input.component || '').trim().toLowerCase();
+      const componentIds = COMPONENT_IDS[componentName] ? [COMPONENT_IDS[componentName]] : [];
+
+      // 6. Labels -> lowercase, hyphenated list, always with qa-reported
+      const rawLabels = Array.isArray(input.labels) ? input.labels : String(input.labels || '').split(',');
+      const labels = [
+        ...new Set(
+          ['qa-reported', ...rawLabels]
+            .map((l) => String(l).trim().toLowerCase().replace(/\s+/g, '-'))
+            .filter(Boolean),
+        ),
+      ];
+
+      return {
+        json: {
+          summary: summary.slice(0, 255),
+          description,
+          priorityId,
+          componentIds,
+          labels,
+          note: priorityNote,
+        },
+      };
+      ```
+
+      If the user did not confirm, or summary/description is missing, the node stops with an error. n8n returns that error text to the agent, so **no ticket is created** and the agent asks the user again.
+
+   4. Add **Jira Software** → *Resource*: Issue, *Operation*: **Create**:
+      - Project: your project (select from list).
+      - Issue Type: **`Bug`** (select from list — fixed, the AI never chooses it).
+      - Summary: `{{ $json.summary }}`
+      - Additional Fields:
+        - Description: `{{ $json.description }}`
+        - Priority: switch the field to **By ID** → `{{ $json.priorityId }}`
+        - Label Names or IDs: *Expression* → `{{ $json.labels }}`
+        - Component Names or IDs: *Expression* → `{{ $json.componentIds }}`
+   5. Add an **Edit Fields (Set)** node with two fields:
+      - `key` = `{{ $json.key }}`
+      - `url` = `https://yourcompany.atlassian.net/browse/{{ $json.key }}`
+   6. Save the workflow (it does not need to be activated).
+
+   **Then, in the main workflow**, attach a **Call n8n Workflow Tool** to the AI Agent:
+   - Name: `create_jira_ticket`
+   - Description: `Creates a Jira Bug ticket. Call only after the user replied "yes" to the latest draft.`
+   - Workflow: **From list** → *Create Jira Bug*
+   - Workflow Inputs (each in Expression mode):
+
+     | Input | Value |
+     |---|---|
+     | `summary` | `{{ $fromAI('summary', 'Bug summary, max 100 characters', 'string') }}` |
+     | `description` | `{{ $fromAI('description', 'Full Bug description in Jira wiki markup, exactly as in the confirmed draft', 'string') }}` |
+     | `priority` | `{{ $fromAI('priority', 'One of: Highest, High, Medium, Low', 'string') }}` |
+     | `component` | `{{ $fromAI('component', 'Component name from the allowed list, or empty', 'string') }}` |
+     | `labels` | `{{ $fromAI('labels', 'Comma-separated lowercase labels, e.g. qa-reported, login, ui', 'string') }}` |
+     | `confirmed` | `{{ $fromAI('confirmed', 'true only if the user replied yes to the latest draft, otherwise false', 'boolean') }}` |
+
 5. Test with the chat panel → check the issue appears in Jira.
 
 ### Phase 3 – Quality & safety
 1. Add tool **Jira Software Tool** → *Issue: Get Many* named `search_jira` with JQL:
    `project = QA AND statusCategory != Done AND text ~ "{{ $fromAI('keywords') }}" ORDER BY created DESC`, limit 5.
-2. Enforce the **confirm-before-create** rule (already in prompt). Optionally add a guard: a Code/IF node that only allows creation when the last user message contains "yes/confirm/create".
+2. **Confirm-before-create** is enforced twice: by the prompt, and by the `confirmed` check in the "Create Jira Bug" sub-workflow (Phase 2, step 4).
 3. Add **reporter / assignee** mapping (e.g. QA's Jira accountId; default assignee = component lead).
 4. Add error handling: an **Error Trigger** workflow that posts failures to Slack/email.
 
@@ -219,6 +339,8 @@ Agent ─▶ "✅ Created QA-123: https://yourcompany.atlassian.net/browse/QA-12
 | 7 | Very similar issue already exists in Jira | Shows duplicate(s), asks whether to continue |
 | 8 | User says "no" / "cancel" | No ticket created |
 | 9 | Jira credentials wrong | Friendly error message, no crash |
+| 10 | Agent calls `create_jira_ticket` with `confirmed = false` | Sub-workflow refuses; agent shows the draft again and asks for "yes"; **no ticket created** |
+| 11 | Priority "High", component "Authentication" | Ticket in Jira shows priority High and component Authentication (IDs mapped correctly) |
 
 ---
 
@@ -259,8 +381,11 @@ Run: `docker compose up -d` → open http://localhost:5678.
 │   └── system_prompt.md         ← agent system message (§5)
 ├── templates/
 │   └── bug_template.md          ← §4.1
+├── scripts/
+│   └── map_fields.js            ← Code node for the sub-workflow (§6)
 ├── workflows/
-│   └── qa_jira_ticket_agent.json ← exported n8n workflow
+│   ├── qa_jira_ticket_agent.json ← exported main workflow
+│   └── create_jira_bug_subworkflow.json ← exported sub-workflow
 └── tests/
     └── test_cases.md            ← §7
 ```
@@ -272,7 +397,8 @@ Run: `docker compose up -d` → open http://localhost:5678.
 - [ ] n8n running
 - [ ] Jira + LLM credentials created in n8n
 - [ ] Workflow: Chat Trigger + AI Agent + Model + Memory
-- [ ] Tool: `create_jira_ticket`
+- [ ] Sub-workflow `Create Jira Bug` built; `PRIORITY_IDS` / `COMPONENT_IDS` filled in
+- [ ] Tool: `create_jira_ticket` (Call n8n Workflow Tool → sub-workflow)
 - [ ] Tool: `search_jira` (duplicate check)
 - [ ] System prompt tuned; all §7 tests pass
 - [ ] Workflow JSON exported to `workflows/`
@@ -299,7 +425,7 @@ Run: `docker compose up -d` → open http://localhost:5678.
    | `<<COMPONENTS>>` | Allowed components | `Authentication, Checkout, Payments, Profile, Admin` |
    | `<<ENVIRONMENTS>>` | Allowed environment names | `Dev, QA, Staging, UAT, Production` |
 
-4. Make sure the tool sub-nodes are named exactly **`create_jira_ticket`** and **`search_jira`** (the prompt refers to these names).
+4. Make sure the tool sub-nodes are named exactly **`create_jira_ticket`** (the Call n8n Workflow Tool from §6) and **`search_jira`** (the prompt refers to these names).
 5. Chat model settings: temperature **0.2**, max tokens **≥ 2000**.
 6. Test with the cases in §7.
 
@@ -375,9 +501,12 @@ Follow these steps in order, every time:
 8. REPORT THE RESULT
    - On success reply:
      "✅ Created <KEY>: <<JIRA_BASE_URL>>/browse/<KEY>"
-   - On failure, show the error message in plain words and suggest a
-     fix (for example a missing required field or wrong permission).
-     Do not retry automatically more than once.
+   - If the tool replies "Not confirmed by user", show the draft again
+     and ask for "yes". Do not call the tool again until the user
+     confirms.
+   - On any other failure, show the error message in plain words and
+     suggest a fix (for example a missing required field or wrong
+     permission). Do not retry automatically more than once.
 
 =====================================================================
 C — CONTEXT
@@ -398,7 +527,9 @@ C — CONTEXT
 - Today's date: {{ $now.toFormat('yyyy-MM-dd') }}
 - Available tools:
     * search_jira        — search open issues by keywords.
-    * create_jira_ticket — create the issue. Use only after confirmation.
+    * create_jira_ticket — create the Bug. Use only after confirmation.
+                           Pass names (e.g. High, Authentication); the
+                           tool converts them to Jira IDs itself.
 
 =====================================================================
 E — EXAMPLE
@@ -515,10 +646,12 @@ B) Draft (always in this order):
 C) When calling create_jira_ticket, pass:
    summary     = the summary text
    priority    = Highest | High | Medium | Low
-   labels      = list of labels
+   labels      = comma-separated labels (e.g. qa-reported, login, ui)
    component   = component name (or empty)
    description = the full description in Jira wiki markup
                  (exactly as shown in the confirmed draft)
+   confirmed   = true (only when the user's latest message confirmed
+                 the draft; otherwise do not call the tool)
 
 D) After creation:
    "✅ Created <KEY>: <<JIRA_BASE_URL>>/browse/<KEY>"
